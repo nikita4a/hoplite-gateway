@@ -101,12 +101,23 @@ except Exception:
 
 def _save_convs() -> None:
     try:
+        while len(_conv_threads) > 50:               # keep last 50 conversations
+            _conv_threads.pop(next(iter(_conv_threads)))
         CONV_FILE.write_text(json.dumps(_conv_threads, indent=1))
     except OSError:
         pass
 _ngrok_proc: subprocess.Popen | None = None
 _ngrok_url: str = ""
-_stats = {"requests": 0, "threads_created": 0, "errors": 0, "started": time.time()}
+_stats = {"requests": 0, "threads_created": 0, "errors": 0, "started": time.time(),
+          "threads_today": 0, "today": ""}
+
+def _bump_thread_day():
+    from datetime import date
+    today = date.today().isoformat()
+    if _stats.get("today") != today:
+        _stats["today"] = today
+        _stats["threads_today"] = 0
+    _stats["threads_today"] += 1
 
 # ── http helpers ───────────────────────────────────────────────────────────
 
@@ -145,6 +156,18 @@ async def _api(client: httpx.AsyncClient, method: str, path: str,
         return r.json()
     raise HopliteError("unreachable", 500)
 
+QUEUE_LIMIT = int(CONFIG.get("queue_limit", 4))   # max concurrently active agent threads
+
+async def _active_thread_count(client: httpx.AsyncClient) -> int:
+    """Best-effort count of queued/running threads (short timeout, skip if slow)."""
+    try:
+        data = await _api(client, "GET", "/api/threads?limit=10", retries=0)
+        threads = data.get("threads") or data.get("data") or []
+        return sum(1 for t in threads
+                   if (t.get("status") or "").lower() in ("queued", "running", "initializing", "pending"))
+    except Exception:
+        return 0
+
 async def _get_project(client: httpx.AsyncClient) -> dict:
     if PROJECT_ID_OVERRIDE:
         return {"id": PROJECT_ID_OVERRIDE, "name": PROJECT_ID_OVERRIDE}
@@ -165,9 +188,23 @@ async def _create_thread(client: httpx.AsyncClient, pid: str, prompt: str,
                          model: str, reasoning: str | None = None) -> str:
     """Create a Hoplite thread. `model` is the gateway model name; mapped to the
     probed-valid Hoplite `model` field. Unknown/invalid → project default."""
-    base = model[:-5] if model.endswith("-fast") else model
+    local = model.endswith("-local")
+    base = model[:-6] if local else (model[:-5] if model.endswith("-fast") else model)
     fast = model.endswith("-fast")
     body: dict[str, Any] = {"projectId": pid, "prompt": prompt}
+    if local:
+        lx = CONFIG.get("local_execution") or {}
+        if lx.get("binding_id") and lx.get("host_id"):
+            body["executionTarget"] = {
+                "kind": "local",
+                "bindingId": lx["binding_id"],
+                "hostId": lx["host_id"],
+                "provider": lx.get("provider", "claude"),
+                "workspaceMode": lx.get("workspace_mode", "worktree"),
+            }
+        else:
+            raise HopliteError("model -local needs local_execution.binding_id/host_id in config.json "
+                               "(get them from Hoplite Desktop app — see ACCESS_PC.md)", 400)
     if fast:
         body["speed"] = "fast"
     mid = MODEL_ID_MAP.get(base, "unknown") if base in MODEL_ID_MAP else None
@@ -182,6 +219,7 @@ async def _create_thread(client: httpx.AsyncClient, pid: str, prompt: str,
         body.pop("reasoning", None)
         data = await _api(client, "POST", "/api/threads", json=body)
     _stats["threads_created"] += 1
+    _bump_thread_day()
     return data["thread"]["id"]
 
 async def _append_message(client: httpx.AsyncClient, tid: str, text: str) -> None:
@@ -405,6 +443,13 @@ async def _complete(body: dict) -> Any:
             async with _client() as c:
                 project = await _get_project(c)
                 tid = _conv_threads.get(conv)
+                if not tid:
+                    active = await _active_thread_count(c)
+                    if active >= QUEUE_LIMIT:
+                        raise HopliteError(
+                            f"{active} agent threads already active (limit {QUEUE_LIMIT}) — "
+                            f"Hoplite sandbox queue would stall this request. Wait for them to finish, "
+                            f"or raise queue_limit in config.json. See https://app.hoplite.sh", 429)
                 if tid:
                     try:
                         await _append_message(c, tid, prompt)
@@ -495,7 +540,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/v1/models")
 async def v1_models():
     now = int(time.time())
-    ids = list(MODELS) + [m + "-fast" for m in MODELS if not m.endswith("-stream")]
+    ids = (list(MODELS) + [m + "-fast" for m in MODELS if not m.endswith("-stream")]
+           + ["hoplite-opus-5-local"])
     return {"object": "list",
             "data": [{"id": m, "object": "model", "created": now, "owned_by": "hoplite"} for m in ids]}
 

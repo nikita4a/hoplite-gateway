@@ -100,6 +100,7 @@ class App:
             ("🔑  Set API key…", self.set_key, "#21262d", FG),
             ("📋  Copy OMP config", self.copy_omp, "#21262d", FG),
             ("📋  Copy OpenCode config", self.copy_opencode, "#21262d", FG),
+            ("🚀  Handoff project → cloud", self.handoff, "#21262d", FG),
             ("📂  Open config.json", self.open_cfg, "#21262d", FG),
         ]
         for i, (text, cmd, bg, fg) in enumerate(buttons):
@@ -271,6 +272,27 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(snippet)
         self.log("OpenCode config copied to clipboard (goes into ~/.config/opencode/opencode.json).")
+
+    def handoff(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Project directory to hand off (git repo with GitHub remote)")
+        if not d:
+            return
+        exe = "hoplite"
+        cand = Path.home() / "AppData/Local/Hoplite/bin/hoplite.exe"
+        if cand.exists():
+            exe = str(cand)
+        self.log(f"Handoff {d} → Hoplite cloud (autopush, opencode session)…")
+
+        def _run():
+            try:
+                flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+                subprocess.Popen([exe, "handoff", "--cwd", d, "--autopush", "--harness", "opencode"],
+                                 creationflags=flags)
+                self.log("Handoff console opened — follow prompts there.")
+            except Exception as e:
+                self.log(f"handoff failed: {e}")
+        threading.Thread(target=_run, daemon=True).start()
 
     def open_cfg(self):
         if not CONFIG_FILE.exists():
