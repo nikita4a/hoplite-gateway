@@ -84,6 +84,7 @@ def _save_config(cfg: dict) -> None:
 
 CONFIG = _load_config()
 API_KEY: str = CONFIG.get("api_key", "")
+GATEWAY_KEY: str = CONFIG.get("gateway_key", "")   # if set, /v1/* requires Bearer <key>
 API_BASE: str = CONFIG.get("api_base", "https://api.hoplite.sh")
 PROJECT_ID_OVERRIDE: str = CONFIG.get("project_id", "")
 DEADLINE = int(CONFIG.get("deadline_s", DEADLINE))
@@ -92,7 +93,17 @@ DEADLINE = int(CONFIG.get("deadline_s", DEADLINE))
 
 _sem = asyncio.Semaphore(MAX_CONCURRENT)
 _project_cache: dict[str, Any] = {"projects": None, "ts": 0.0}
-_conv_threads: dict[str, str] = {}       # conv key → hoplite thread id
+CONV_FILE = BASE_DIR / "conv_threads.json"
+try:
+    _conv_threads: dict[str, str] = json.loads(CONV_FILE.read_text()) if CONV_FILE.exists() else {}
+except Exception:
+    _conv_threads = {}
+
+def _save_convs() -> None:
+    try:
+        CONV_FILE.write_text(json.dumps(_conv_threads, indent=1))
+    except OSError:
+        pass
 _ngrok_proc: subprocess.Popen | None = None
 _ngrok_url: str = ""
 _stats = {"requests": 0, "threads_created": 0, "errors": 0, "started": time.time()}
@@ -405,6 +416,7 @@ async def _complete(body: dict) -> Any:
                     tid = await _create_thread(c, project["id"], prompt, model,
                                                reasoning=body.get("reasoning_effort"))
                     _conv_threads[conv] = tid
+                    _save_convs()
 
                 if stream:
                     return StreamingResponse(
@@ -487,8 +499,22 @@ async def v1_models():
     return {"object": "list",
             "data": [{"id": m, "object": "model", "created": now, "owned_by": "hoplite"} for m in ids]}
 
+def _check_auth(request: Request):
+    """Optional bearer gate. Blocks drive-by localhost abuse (CORS *) and
+    ngrok freeloaders when gateway_key is configured."""
+    if not GATEWAY_KEY:
+        return None
+    h = request.headers.get("authorization", "")
+    if h == f"Bearer {GATEWAY_KEY}" or request.headers.get("x-api-key") == GATEWAY_KEY:
+        return None
+    return _err("invalid gateway key (set Authorization: Bearer <gateway_key>)", "auth_error", 401)
+
+
 @app.post("/v1/chat/completions")
 async def v1_chat(request: Request):
+    denied = _check_auth(request)
+    if denied:
+        return denied
     body = await request.json()
     result = await _complete(body)
     if isinstance(result, StreamingResponse):

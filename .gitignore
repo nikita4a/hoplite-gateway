@@ -17,4 +17,7 @@ Thumbs.db
 *.log
 *.bak
 data/
-screenshots/
+screenshots/conv_threads.json
+status.json
+watchdog.log
+watchdog.lock
