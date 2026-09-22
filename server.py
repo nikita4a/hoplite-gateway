@@ -46,17 +46,24 @@ POLL_FAST, POLL_SLOW = 1.0, 2.5   # seconds between message polls
 DEADLINE = 540              # max seconds waiting for one agent answer (sandbox queue can be slow)
 PROJECT_TTL = 300           # seconds to cache project list
 
-# model → Hoplite modelId (None = project default). Invalid ids auto-fallback.
+# gateway model → Hoplite `model` field (probed against the live API 2026-09).
+# None = Hoplite project default. "-fast" suffix on any name → speed:fast.
 MODEL_ID_MAP = {
-    "hoplite-opus-5": "claude-opus-5",
-    "hoplite-opus": "claude-opus-5",
-    "hoplite-sonnet": "claude-sonnet-5",
+    "hoplite-opus-5":       "claude-opus-5",     # Claude Opus 5.5 generation
+    "hoplite-sonnet-5":     "claude-sonnet-5",
+    "hoplite-opus-4.8":     "claude-opus-4-8",
+    "hoplite-gpt-5.5":      "gpt-5.5",
+    "hoplite-gpt-5.6-terra": "gpt-5.6-terra",
+    "hoplite-agent":        None,
+    "hoplite-agent-stream": None,
+    "hoplite-code":         None,
+    "hoplite-review":       None,
+    "hoplite-plan":         None,
 }
 
-MODELS = [
-    "hoplite-opus-5", "hoplite-agent", "hoplite-agent-stream",
-    "hoplite-code", "hoplite-review", "hoplite-plan",
-]
+MODELS = list(MODEL_ID_MAP.keys())
+
+REASONING_MODES = {"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "canceled", "stopped", "error"}
 
@@ -143,17 +150,25 @@ async def _get_project(client: httpx.AsyncClient) -> dict:
 # ── hoplite thread operations ──────────────────────────────────────────────
 
 async def _create_thread(client: httpx.AsyncClient, pid: str, prompt: str,
-                         model: str) -> str:
+                         model: str, reasoning: str | None = None) -> str:
+    """Create a Hoplite thread. `model` is the gateway model name; mapped to the
+    probed-valid Hoplite `model` field. Unknown/invalid → project default."""
+    base = model[:-5] if model.endswith("-fast") else model
+    fast = model.endswith("-fast")
     body: dict[str, Any] = {"projectId": pid, "prompt": prompt}
-    mid = MODEL_ID_MAP.get(model)
+    if fast:
+        body["speed"] = "fast"
+    mid = MODEL_ID_MAP.get(base, "unknown") if base in MODEL_ID_MAP else None
     if mid:
-        try:
-            data = await _api(client, "POST", "/api/threads", json={**body, "modelId": mid})
-            _stats["threads_created"] += 1
-            return data["thread"]["id"]
-        except HopliteError:
-            pass  # invalid modelId → fall through to default
-    data = await _api(client, "POST", "/api/threads", json=body)
+        body["model"] = mid
+    if reasoning and reasoning.lower() in REASONING_MODES:
+        body["reasoning"] = {"mode": reasoning.lower()}
+    try:
+        data = await _api(client, "POST", "/api/threads", json=body, retries=1)
+    except HopliteError:
+        body.pop("model", None)   # invalid model → retry on project default
+        body.pop("reasoning", None)
+        data = await _api(client, "POST", "/api/threads", json=body)
     _stats["threads_created"] += 1
     return data["thread"]["id"]
 
@@ -386,7 +401,8 @@ async def _complete(body: dict) -> Any:
                               file=sys.stderr, flush=True)
                         tid = None  # thread gone/unusable → recreate with serialized history
                 if not tid:
-                    tid = await _create_thread(c, project["id"], prompt, model)
+                    tid = await _create_thread(c, project["id"], prompt, model,
+                                               reasoning=body.get("reasoning_effort"))
                     _conv_threads[conv] = tid
 
                 if stream:
@@ -466,8 +482,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/v1/models")
 async def v1_models():
     now = int(time.time())
+    ids = list(MODELS) + [m + "-fast" for m in MODELS if not m.endswith("-stream")]
     return {"object": "list",
-            "data": [{"id": m, "object": "model", "created": now, "owned_by": "hoplite"} for m in MODELS]}
+            "data": [{"id": m, "object": "model", "created": now, "owned_by": "hoplite"} for m in ids]}
 
 @app.post("/v1/chat/completions")
 async def v1_chat(request: Request):

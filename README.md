@@ -122,14 +122,20 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 - **Concurrency guard** — max 3 parallel agent threads.
 - **Project cache** — 5 min TTL, optional `project_id` override.
 
-## Models
+## Models (probed against the live Hoplite API)
 
-| Model | Backend |
-|-------|---------|
-| `hoplite-opus-5` | Claude Opus 5.5 (via `modelId: claude-opus-5`) |
-| `hoplite-agent` | project default agent |
-| `hoplite-agent-stream` | default, streaming-oriented |
-| `hoplite-code` / `hoplite-review` / `hoplite-plan` | default agent, semantic labels |
+| Gateway model | Hoplite `model` | Notes |
+|---------------|-----------------|-------|
+| **`hoplite-opus-5`** | `claude-opus-5` | **Claude Opus 5.5** |
+| `hoplite-sonnet-5` | `claude-sonnet-5` | |
+| `hoplite-opus-4.8` | `claude-opus-4-8` | |
+| `hoplite-gpt-5.5` | `gpt-5.5` | |
+| `hoplite-gpt-5.6-terra` | `gpt-5.6-terra` | |
+| `hoplite-agent` | project default | |
+| `<name>-fast` | + `speed: "fast"` | e.g. `hoplite-opus-5-fast` |
+
+`reasoning_effort` (`off…xhigh|max`) maps to Hoplite `reasoning.mode`.
+Full walkthrough (Russian): **[GUIDE.md](GUIDE.md)**
 
 ## Endpoints
 
