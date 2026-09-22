@@ -1,0 +1,6 @@
+{
+  "api_key": "hop_YOUR_KEY_HERE",
+  "api_base": "https://api.hoplite.sh",
+  "project_id": "",
+  "ngrok_token": ""
+}

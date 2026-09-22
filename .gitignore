@@ -1,0 +1,20 @@
+# secrets — NEVER commit
+config.json
+cookies.json
+mcp_token.json
+*.token
+.env
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
+Thumbs.db
+
+# junk
+*.log
+*.bak
+data/
+screenshots/

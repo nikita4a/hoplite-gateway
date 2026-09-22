@@ -1,0 +1,15 @@
+{
+  "provider": {
+    "hoplite": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "sk-local"
+      },
+      "models": {
+        "hoplite-opus-5": { "name": "Hoplite Opus 5.5" },
+        "hoplite-agent": { "name": "Hoplite Agent" }
+      }
+    }
+  }
+}
