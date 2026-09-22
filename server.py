@@ -43,7 +43,7 @@ HOST, PORT = "127.0.0.1", 8787
 
 MAX_CONCURRENT = 3          # parallel Hoplite threads
 POLL_FAST, POLL_SLOW = 1.0, 2.5   # seconds between message polls
-DEADLINE = 540              # max seconds waiting for one agent answer (sandbox queue can be slow)
+DEADLINE = 540              # default; override with "deadline_s" in config.json
 PROJECT_TTL = 300           # seconds to cache project list
 
 # gateway model → Hoplite `model` field (probed against the live API 2026-09).
@@ -86,6 +86,7 @@ CONFIG = _load_config()
 API_KEY: str = CONFIG.get("api_key", "")
 API_BASE: str = CONFIG.get("api_base", "https://api.hoplite.sh")
 PROJECT_ID_OVERRIDE: str = CONFIG.get("project_id", "")
+DEADLINE = int(CONFIG.get("deadline_s", DEADLINE))
 
 # ── runtime state ──────────────────────────────────────────────────────────
 
