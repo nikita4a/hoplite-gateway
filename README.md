@@ -137,6 +137,23 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 `reasoning_effort` (`off…xhigh|max`) maps to Hoplite `reasoning.mode`.
 Full walkthrough (Russian): **[GUIDE.md](GUIDE.md)**
 
+## PC Agent — cloud Opus 5.5 with hands on YOUR machine
+
+`pc_agent.py` gives the cloud agent **local tools** (read_file, write_file,
+list_dir, run_cmd) executed on your PC. The agent sends tool_calls, this script
+runs them locally and returns results — full OpenAI function-calling loop.
+
+```bash
+python pc_agent.py "create folder x, put a file in it, show me the result"
+python pc_agent.py     # interactive REPL
+```
+
+Every tool execution is logged to `pc_agent_log.jsonl`. `run_cmd` runs arbitrary
+shell — authorized-lab tool, keep it that way.
+
+The same mechanism powers OMP: when `hoplite-opus-5` is the session model, OMP's
+own tools (read/bash/edit) execute locally while the brain runs in the cloud.
+
 ## MCP server (built-in, at `/mcp`)
 
 The gateway is ALSO an MCP server — use the cloud agent as a **tool** instead of

@@ -1,23 +1,19 @@
-# secrets — NEVER commit
-config.json
-cookies.json
-mcp_token.json
-*.token
-.env
-
-# python
-__pycache__/
-*.pyc
-
-# os
-.DS_Store
-Thumbs.db
-
-# junk
-*.log
-*.bak
-data/
-screenshots/conv_threads.json
-status.json
-watchdog.log
-watchdog.lock
+# DENY ALL by default — explicit allowlist only (directory has legacy secrets)
+*
+!.gitignore
+!server.py
+!menu.pyw
+!watchdog.pyw
+!start.bat
+!handoff.bat
+!refresh_hoplite_mcp.py
+!push_all.py
+!tests_gateway.py
+!requirements.txt
+!config.example.json
+!opencode_config.json
+!README.md
+!GUIDE.md
+!ACCESS_PC.md
+!POST.md
+!pc_agent.py

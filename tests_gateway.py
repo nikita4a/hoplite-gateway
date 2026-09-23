@@ -64,6 +64,63 @@ def test_latest_assistant():
     assert srv._latest_assistant(msgs) == "new answer"
 
 
+def test_ask_timeout_envelope():
+    """Sentinel's check: wait_s floor allows 1.0 + partial envelope, mocked (no network)."""
+    import asyncio
+
+    seen = {}
+
+    async def fake_ask(prompt, conv, model="hoplite-agent", reasoning=None,
+                       on_delta=None, wait_s=None):
+        seen["wait_s"] = wait_s
+        return "thr_fake123", None      # None = still running → envelope path
+
+    orig = srv._ask_agent
+    srv._ask_agent = fake_ask
+    try:
+        out = asyncio.run(srv._mcp_dispatch(
+            "hoplite_ask", {"prompt": "x", "conversation": "t", "wait_s": 1}))
+    finally:
+        srv._ask_agent = orig
+
+    assert seen["wait_s"] == 1.0, f"floor must allow 1.0, got {seen['wait_s']}"
+    assert "[still running after 1s]" in out, out
+    assert "thr_fake123" in out and "hoplite_task_status" in out, out
+
+
+def test_ask_returns_answer_directly():
+    import asyncio
+
+    async def fake_ask(prompt, conv, model="hoplite-agent", reasoning=None,
+                       on_delta=None, wait_s=None):
+        return "thr_x", "FINAL-ANSWER"
+
+    orig = srv._ask_agent
+    srv._ask_agent = fake_ask
+    try:
+        out = asyncio.run(srv._mcp_dispatch("hoplite_ask", {"prompt": "x"}))
+    finally:
+        srv._ask_agent = orig
+    assert out == "FINAL-ANSWER"
+
+
+def test_slim_schema_and_wrap_cap():
+    """Big toolsets (OMP sends dozens of tools) must fit: descriptions trimmed, cap 20000."""
+    big = [{"type": "function", "function": {
+        "name": f"tool_{i}",
+        "description": "D" * 5000,
+        "parameters": {"type": "object",
+                       "properties": {"a": {"type": "string", "description": "x" * 900}},
+                       "required": ["a"]}}} for i in range(10)]
+    wrapped = srv._wrap_tools("task", big)
+    assert wrapped.startswith("task")
+    assert len(wrapped) <= 20000 + 800          # cap + instruction text
+    for i in range(10):                          # all tool names survived
+        assert f"tool_{i}" in wrapped
+    slim = srv._slim_schema({"description": "y" * 500, "type": "object"})
+    assert len(slim["description"]) <= 120
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -23,7 +23,7 @@ H = {"Authorization": f"token {TOKEN}", "User-Agent": "hoplite-gw",
 
 # only these files ever leave the machine (secrets stay home)
 ALLOW = ["server.py", "menu.pyw", "start.bat", "README.md", "requirements.txt",
-         "config.example.json", "opencode_config.json", ".gitignore", "push_all.py", "tests_gateway.py", "GUIDE.md", "refresh_hoplite_mcp.py", "watchdog.pyw", "POST.md", "handoff.bat", "ACCESS_PC.md"]
+         "config.example.json", "opencode_config.json", ".gitignore", "push_all.py", "tests_gateway.py", "GUIDE.md", "refresh_hoplite_mcp.py", "watchdog.pyw", "POST.md", "handoff.bat", "ACCESS_PC.md", "pc_agent.py"]
 
 
 def gh(method: str, path: str, data=None, raw_body=None, retries: int = 4):

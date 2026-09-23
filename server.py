@@ -341,14 +341,39 @@ RULES:
 - When you receive "Tool result:" messages, continue the task.
 """
 
+def _slim_schema(params: dict, depth: int = 0) -> Any:
+    """Compress a JSON schema: keep structure + types, trim descriptions."""
+    if not isinstance(params, dict) or depth > 4:
+        return params
+    out = {}
+    for k, v in params.items():
+        if k == "description" and isinstance(v, str):
+            out[k] = v[:120]
+        elif isinstance(v, dict):
+            out[k] = _slim_schema(v, depth + 1)
+        elif isinstance(v, list) and k in ("properties", "items"):
+            out[k] = [_slim_schema(i, depth + 1) for i in v]
+        else:
+            out[k] = v
+    return out
+
+
 def _wrap_tools(prompt: str, tools: list[dict]) -> str:
-    slim = [{"name": t["function"]["name"],
-             "description": t["function"].get("description", ""),
-             "parameters": t["function"].get("parameters", {})} for t in tools
-            if t.get("type") == "function" and "function" in t]
+    slim = []
+    for t in tools:
+        if t.get("type") != "function" or "function" not in t:
+            continue
+        fn = t["function"]
+        entry = {"name": fn["name"],
+                 "description": str(fn.get("description", ""))[:240]}
+        params = fn.get("parameters")
+        if params:
+            entry["parameters"] = _slim_schema(params)
+        slim.append(entry)
     if not slim:
         return prompt
-    return prompt + _TOOL_INSTRUCTIONS.format(tools=json.dumps(slim, ensure_ascii=False)[:6000])
+    return prompt + _TOOL_INSTRUCTIONS.format(
+        tools=json.dumps(slim, ensure_ascii=False)[:20000])
 
 def _parse_tool_calls(text: str) -> list[dict] | None:
     """Detect the JSON tool_calls protocol in agent output."""
@@ -835,7 +860,7 @@ async def _mcp_dispatch(name: str, args: dict) -> str:
             raise HopliteError("prompt is required", 400)
         conv = f"mcp:{args.get('conversation') or 'default'}"
         model = args.get("model") or "hoplite-opus-5"
-        wait_s = min(max(float(args.get("wait_s", MCP_ASK_DEFAULT_WAIT)), 10.0), float(DEADLINE))
+        wait_s = min(max(float(args.get("wait_s", MCP_ASK_DEFAULT_WAIT)), 1.0), float(DEADLINE))
         tid, answer = await _ask_agent(prompt, conv, model,
                                        reasoning=args.get("reasoning_effort"), wait_s=wait_s)
         if answer is not None:
