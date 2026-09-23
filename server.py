@@ -85,6 +85,7 @@ def _save_config(cfg: dict) -> None:
 CONFIG = _load_config()
 API_KEY: str = CONFIG.get("api_key", "")
 GATEWAY_KEY: str = CONFIG.get("gateway_key", "")   # if set, /v1/* requires Bearer <key>
+SESSION_COOKIES: dict = CONFIG.get("cookies", {})  # browser session — required for message append (api key can't)
 API_BASE: str = CONFIG.get("api_base", "https://api.hoplite.sh")
 PROJECT_ID_OVERRIDE: str = CONFIG.get("project_id", "")
 DEADLINE = int(CONFIG.get("deadline_s", DEADLINE))
@@ -125,7 +126,8 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=API_BASE,
         headers={"X-Api-Key": API_KEY, "Accept": "application/json",
-                 "User-Agent": "HopliteOpenAIGateway/3.0"},
+                 "Origin": "https://app.hoplite.sh",
+                 "User-Agent": "HopliteOpenAIGateway/3.8"},
         timeout=httpx.Timeout(60.0, connect=10.0),
     )
 
@@ -224,7 +226,28 @@ async def _create_thread(client: httpx.AsyncClient, pid: str, prompt: str,
     return data["thread"]["id"]
 
 async def _append_message(client: httpx.AsyncClient, tid: str, text: str) -> None:
-    await _api(client, "POST", f"/api/threads/{tid}/messages", json={"content": text})
+    """Proven auth matrix (2026-09): hop_ API key can create/read threads but
+    POST /messages rejects it (401 invalid_api_key); session cookies + Origin
+    header work (201). So: session first, api-key fallback."""
+    if SESSION_COOKIES:
+        try:
+            async with httpx.AsyncClient(
+                base_url=API_BASE, cookies=SESSION_COOKIES,
+                headers={"Origin": "https://app.hoplite.sh",
+                         "Referer": "https://app.hoplite.sh/",
+                         "Accept": "application/json",
+                         "User-Agent": "HopliteOpenAIGateway/3.8"},
+                timeout=httpx.Timeout(60.0, connect=10.0)) as sc:
+                r = await sc.post(f"/api/threads/{tid}/messages", json={"content": text})
+                if r.status_code in (200, 201):
+                    return
+                if r.status_code == 401:
+                    print("[gw] session cookie expired — refresh cookies in config.json; "
+                          "trying api-key fallback", file=sys.stderr, flush=True)
+        except httpx.HTTPError as e:
+            print(f"[gw] session append network error: {e}", file=sys.stderr, flush=True)
+    await _api(client, "POST", f"/api/threads/{tid}/messages", json={"content": text},
+               headers={"Origin": "https://app.hoplite.sh"})
 
 async def _msg_list(client: httpx.AsyncClient, tid: str) -> list[dict]:
     data = await _api(client, "GET", f"/api/threads/{tid}/messages")
@@ -421,6 +444,16 @@ async def _ask_agent(prompt: str, conv: str, model: str = "hoplite-agent",
                         f"{active} agent threads already active (limit {QUEUE_LIMIT}) — "
                         f"wait or raise queue_limit in config.json", 429)
             if tid:
+                # wait for the previous turn to finish, else append is rejected
+                # and we'd burn a NEW cold sandbox (slow + quota waste)
+                for _ in range(10):
+                    try:
+                        st = await _thread_status(c, tid)
+                    except HopliteError:
+                        st = ""
+                    if st in ("ready", "completed", "idle", "waiting") or not st:
+                        break
+                    await asyncio.sleep(3)
                 try:
                     await _append_message(c, tid, prompt)
                 except Exception as ae:
@@ -491,16 +524,19 @@ async def _complete(body: dict) -> Any:
     conv = _conv_key(messages, body.get("user"))
     history = _render_history(messages)
 
-    prompt_parts = []
+    fresh_parts = []
     if history:
-        prompt_parts.append(f"[earlier conversation]\n{history}")
+        fresh_parts.append(f"[earlier conversation]\n{history}")
     if tool_results:
-        prompt_parts.append(tool_results)
+        fresh_parts.append(tool_results)
     if user_text and not tool_results:
-        prompt_parts.append(user_text)
-    prompt = "\n\n".join(prompt_parts) or "Hello — introduce yourself briefly."
+        fresh_parts.append(user_text)
+    prompt_fresh = "\n\n".join(fresh_parts) or "Hello — introduce yourself briefly."
+    # append path: thread already holds the context — send only the new payload
+    prompt_append = (tool_results or user_text or "continue").strip()
     if tools:
-        prompt = _wrap_tools(prompt, tools)
+        prompt_fresh = _wrap_tools(prompt_fresh, tools)
+        prompt_append = _wrap_tools(prompt_append, tools)
 
     async with _sem:
         try:
@@ -515,14 +551,22 @@ async def _complete(body: dict) -> Any:
                             f"Hoplite sandbox queue would stall this request. Wait for them to finish, "
                             f"or raise queue_limit in config.json. See https://app.hoplite.sh", 429)
                 if tid:
+                    for _ in range(10):        # let the previous turn finish (warm sandbox reuse)
+                        try:
+                            st = await _thread_status(c, tid)
+                        except HopliteError:
+                            st = ""
+                        if st in ("ready", "completed", "idle", "waiting") or not st:
+                            break
+                        await asyncio.sleep(3)
                     try:
-                        await _append_message(c, tid, prompt)
+                        await _append_message(c, tid, prompt_append)
                     except Exception as ae:
                         print(f"[gw] append to {tid} failed ({ae}) — recreating thread with history",
                               file=sys.stderr, flush=True)
                         tid = None  # thread gone/unusable → recreate with serialized history
                 if not tid:
-                    tid = await _create_thread(c, project["id"], prompt, model,
+                    tid = await _create_thread(c, project["id"], prompt_fresh, model,
                                                reasoning=body.get("reasoning_effort"))
                     _conv_threads[conv] = tid
                     _save_convs()

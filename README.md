@@ -208,6 +208,20 @@ each turn spins a sandbox → expect **30–120 s per message**. Great for
 rate-limits thread creation per account (429) — the gateway backs off and
 retries automatically.
 
+## Session cookies (needed for conversation continuity)
+
+The `hop_` API key can create/read threads but **cannot append messages**
+(Hoplite returns 401 — proven). Appending uses your **browser session cookies +
+Origin header** (proven 201). Put them in `config.json`:
+
+```json
+{"cookies": {"__Secure-better-auth.session_token": "...", "_iidt": "..."}}
+```
+
+Session lives ~7 days (app.hoplite.sh → DevTools → Application → Cookies).
+When it expires the gateway logs it and falls back to recreating threads with
+serialized history (works, but cold sandbox each round). Refresh cookies weekly.
+
 ## Troubleshooting
 
 | Symptom | Fix |
