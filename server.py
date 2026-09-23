@@ -645,7 +645,9 @@ async def _stream_run(c: httpx.AsyncClient, cid: str, model: str,
                     yield ": hb\n\n"   # SSE comment heartbeat — keeps idle connections alive
                 continue
             last_emit = time.time()
-            if piece:
+            if piece and not tools:
+                # With tools the agent may embed the raw protocol JSON in its prose
+                # and deltas cannot be retracted once sent — withhold, emit once below.
                 yield _sse(cid, model, {"content": piece})
             if task.done() and q.empty():
                 break
@@ -657,8 +659,11 @@ async def _stream_run(c: httpx.AsyncClient, cid: str, model: str,
                 for i, tc in enumerate(calls)]})
             yield _sse(cid, model, {}, "tool_calls")
         else:
-            # flush any remainder not yet emitted (final fetch chunk)
-            if len(text) > len(buffer):
+            if tools:
+                if text:
+                    yield _sse(cid, model, {"content": text})
+            elif len(text) > len(buffer):
+                # flush any remainder not yet emitted (final fetch chunk)
                 yield _sse(cid, model, {"content": text[len(buffer):]})
             yield _sse(cid, model, {}, "stop")
     except HopliteError as e:

@@ -335,6 +335,73 @@ def test_busy_gateway_returns_429_fast():
     assert time.time() - t0 < 10, "must fail fast instead of waiting for a slot"
 
 
+def _sse_chunks(agen):
+    """Parse every SSE data frame into its choice dict (delta + finish_reason)."""
+    out = []
+
+    async def go():
+        async for chunk in agen:
+            for line in chunk.splitlines():
+                if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+                    continue
+                payload = json.loads(line[6:])
+                out.extend(payload["choices"])
+
+    asyncio.run(go())
+    return out
+
+
+def test_stream_with_tools_does_not_leak_protocol_json():
+    """With tools in play the raw protocol JSON must never reach the client as text.
+
+    Real failure (omp, live): the tool_calls JSON was streamed as content deltas AND
+    executed as a tool call, so the transcript showed '{"tool_calls": [...]}' above the
+    rendered Read tree. Non-streaming cleared the text (`if calls: text = ""`); the
+    stream path cannot retract deltas it already sent, so it must withhold them.
+    """
+    payload = '{"tool_calls": [{"name": "read", "arguments": {"path": "a.py"}}]}'
+
+    async def fake_run(client, tid, on_delta=None):
+        await on_delta(payload[:20])
+        await on_delta(payload[20:])
+        return payload
+
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    orig = srv._run_agent
+    srv._run_agent = fake_run
+    try:
+        chunks = _sse_chunks(srv._stream_run(None, "cid", "m", "tid", tools))
+    finally:
+        srv._run_agent = orig
+
+    content = "".join(c.get("delta", {}).get("content") or "" for c in chunks)
+    assert content == "", f"protocol JSON leaked into stream content: {content!r}"
+    tc = [c for c in chunks if c.get("delta", {}).get("tool_calls")]
+    assert len(tc) == 1, f"expected exactly one tool_calls chunk, got {len(tc)}"
+    assert tc[0]["delta"]["tool_calls"][0]["function"]["name"] == "read"
+    assert any(c.get("finish_reason") == "tool_calls" for c in chunks)
+
+
+def test_stream_with_tools_prose_delivered_once():
+    """Tools present but the agent answered plain prose: text arrives exactly once."""
+    async def fake_run(client, tid, on_delta=None):
+        await on_delta("Just ")
+        await on_delta("prose")
+        return "Just prose"
+
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    orig = srv._run_agent
+    srv._run_agent = fake_run
+    try:
+        chunks = _sse_chunks(srv._stream_run(None, "cid", "m", "tid", tools))
+    finally:
+        srv._run_agent = orig
+
+    content = "".join(c.get("delta", {}).get("content") or "" for c in chunks)
+    assert content == "Just prose", content
+    assert any(c.get("finish_reason") == "stop" for c in chunks)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
