@@ -307,6 +307,34 @@ def test_stream_response_owns_its_client():
         "the concurrency guard must be held for the whole stream"
 
 
+def test_busy_gateway_returns_429_fast():
+    """No request may wait forever when all concurrency slots are held."""
+    import time
+    orig_to = srv.SEM_ACQUIRE_TIMEOUT
+    srv.SEM_ACQUIRE_TIMEOUT = 1          # keep the test fast
+    t0 = time.time()
+
+    async def scenario():
+        for _ in range(srv.MAX_CONCURRENT):
+            await srv._sem.acquire()     # drain every slot
+        try:
+            return await srv._complete({
+                "model": "hoplite-opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            })
+        finally:
+            for _ in range(srv.MAX_CONCURRENT):
+                srv._sem.release()
+
+    try:
+        resp = asyncio.run(scenario())
+    finally:
+        srv.SEM_ACQUIRE_TIMEOUT = orig_to
+    assert resp.status_code == 429, f"expected 429, got {resp}"
+    assert time.time() - t0 < 10, "must fail fast instead of waiting for a slot"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

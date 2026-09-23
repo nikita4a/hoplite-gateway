@@ -43,6 +43,7 @@ LEGACY_CONFIG = BASE_DIR / "cookies.json"   # backward compat
 HOST, PORT = "127.0.0.1", 8787
 
 MAX_CONCURRENT = 3          # parallel Hoplite threads
+SEM_ACQUIRE_TIMEOUT = 30    # wait for a concurrency slot before answering 429
 POLL_FAST, POLL_SLOW = 1.0, 2.5   # seconds between message polls
 DEADLINE = 540              # default; override with "deadline_s" in config.json
 PROJECT_TTL = 300           # seconds to cache project list
@@ -546,56 +547,62 @@ async def _complete(body: dict) -> Any:
         prompt_fresh = _wrap_tools(prompt_fresh, tools)
         prompt_append = _wrap_tools(prompt_append, tools)
 
-    async with _sem:
-        try:
-            async with _client() as c:
-                project = await _get_project(c)
-                tid = _conv_threads.get(conv)
-                if not tid:
-                    active = await _active_thread_count(c)
-                    if active >= QUEUE_LIMIT:
-                        raise HopliteError(
-                            f"{active} agent threads already active (limit {QUEUE_LIMIT}) — "
-                            f"Hoplite sandbox queue would stall this request. Wait for them to finish, "
-                            f"or raise queue_limit in config.json. See https://app.hoplite.sh", 429)
-                if tid:
-                    for _ in range(10):        # let the previous turn finish (warm sandbox reuse)
-                        try:
-                            st = await _thread_status(c, tid)
-                        except HopliteError:
-                            st = ""
-                        if st in ("ready", "completed", "idle", "waiting") or not st:
-                            break
-                        await asyncio.sleep(3)
+    try:
+        await asyncio.wait_for(_sem.acquire(), timeout=SEM_ACQUIRE_TIMEOUT)
+    except asyncio.TimeoutError:
+        return _err(f"gateway busy: all {MAX_CONCURRENT} agent slots busy for "
+                    f"{SEM_ACQUIRE_TIMEOUT}s — retry later", "gateway_error", 429)
+    try:
+        async with _client() as c:
+            project = await _get_project(c)
+            tid = _conv_threads.get(conv)
+            if not tid:
+                active = await _active_thread_count(c)
+                if active >= QUEUE_LIMIT:
+                    raise HopliteError(
+                        f"{active} agent threads already active (limit {QUEUE_LIMIT}) — "
+                        f"Hoplite sandbox queue would stall this request. Wait for them to finish, "
+                        f"or raise queue_limit in config.json. See https://app.hoplite.sh", 429)
+            if tid:
+                for _ in range(10):        # let the previous turn finish (warm sandbox reuse)
                     try:
-                        await _append_message(c, tid, prompt_append)
-                    except Exception as ae:
-                        print(f"[gw] append to {tid} failed ({ae}) — recreating thread with history",
-                              file=sys.stderr, flush=True)
-                        tid = None  # thread gone/unusable → recreate with serialized history
-                if not tid:
-                    tid = await _create_thread(c, project["id"], prompt_fresh, model,
-                                               reasoning=body.get("reasoning_effort"))
-                    _conv_threads[conv] = tid
-                    _save_convs()
+                        st = await _thread_status(c, tid)
+                    except HopliteError:
+                        st = ""
+                    if st in ("ready", "completed", "idle", "waiting") or not st:
+                        break
+                    await asyncio.sleep(3)
+                try:
+                    await _append_message(c, tid, prompt_append)
+                except Exception as ae:
+                    print(f"[gw] append to {tid} failed ({ae}) — recreating thread with history",
+                          file=sys.stderr, flush=True)
+                    tid = None  # thread gone/unusable → recreate with serialized history
+            if not tid:
+                tid = await _create_thread(c, project["id"], prompt_fresh, model,
+                                           reasoning=body.get("reasoning_effort"))
+                _conv_threads[conv] = tid
+                _save_convs()
 
-                if stream:
-                    return StreamingResponse(
-                        _stream_owned(cid, model, tid, tools),
-                        media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            if stream:
+                return StreamingResponse(
+                    _stream_owned(cid, model, tid, tools),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-                text = await _run_agent(c, tid)
-                calls = _parse_tool_calls(text) if tools else None
-                if calls:
-                    text = ""
-                return JSONResponse(_chat_response(cid, model, text, calls))
-        except HopliteError as e:
-            return _err(str(e), "gateway_error", e.status)
-        except httpx.HTTPError as e:
-            return _err(f"network error talking to Hoplite: {e}", "gateway_error", 502)
-        except Exception as e:
-            return _err(f"gateway bug: {type(e).__name__}: {e}", "gateway_error", 500)
+            text = await _run_agent(c, tid)
+            calls = _parse_tool_calls(text) if tools else None
+            if calls:
+                text = ""
+            return JSONResponse(_chat_response(cid, model, text, calls))
+    except HopliteError as e:
+        return _err(str(e), "gateway_error", e.status)
+    except httpx.HTTPError as e:
+        return _err(f"network error talking to Hoplite: {e}", "gateway_error", 502)
+    except Exception as e:
+        return _err(f"gateway bug: {type(e).__name__}: {e}", "gateway_error", 500)
+    finally:
+        _sem.release()
 
 async def _stream_owned(cid: str, model: str, tid: str, tools) -> AsyncGenerator[str, None]:
     """Own the httpx client and the concurrency slot for the WHOLE stream.
