@@ -157,6 +157,7 @@ async def _api(client: httpx.AsyncClient, method: str, path: str,
     raise HopliteError("unreachable", 500)
 
 QUEUE_LIMIT = int(CONFIG.get("queue_limit", 4))   # max concurrently active agent threads
+MCP_ASK_DEFAULT_WAIT = int(CONFIG.get("mcp_ask_wait_s", 120))
 
 async def _active_thread_count(client: httpx.AsyncClient) -> int:
     """Best-effort count of queued/running threads (short timeout, skip if slow)."""
@@ -379,6 +380,44 @@ def _parse_tool_calls(text: str) -> list[dict] | None:
         })
     return out or None
 
+async def _ask_agent(prompt: str, conv: str, model: str = "hoplite-agent",
+                     reasoning: str | None = None, on_delta=None,
+                     wait_s: float | None = None) -> tuple[str, str | None]:
+    """Get-or-create the thread for `conv`, send prompt, wait for the agent answer.
+    Same proven flow the OpenAI endpoint uses. Raises HopliteError on hard failures."""
+    async with _sem:
+        async with _client() as c:
+            project = await _get_project(c)
+            tid = _conv_threads.get(conv)
+            if not tid:
+                active = await _active_thread_count(c)
+                if active >= QUEUE_LIMIT:
+                    raise HopliteError(
+                        f"{active} agent threads already active (limit {QUEUE_LIMIT}) — "
+                        f"wait or raise queue_limit in config.json", 429)
+            if tid:
+                try:
+                    await _append_message(c, tid, prompt)
+                except Exception as ae:
+                    print(f"[gw] append to {tid} failed ({ae}) — recreating", file=sys.stderr, flush=True)
+                    tid = None
+            if not tid:
+                tid = await _create_thread(c, project["id"], prompt, model, reasoning=reasoning)
+                _conv_threads[conv] = tid
+                _save_convs()
+            if wait_s:
+                try:
+                    return tid, await asyncio.wait_for(_run_agent(c, tid, on_delta), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    partial = ""
+                    try:
+                        partial = _latest_assistant(await _msg_list(c, tid))
+                    except Exception:
+                        pass
+                    return tid, partial or None
+            return tid, await _run_agent(c, tid, on_delta)
+
+
 # ── OpenAI response builders ───────────────────────────────────────────────
 
 def _chat_response(cid: str, model: str, content: str,
@@ -534,7 +573,7 @@ async def _stream_run(c: httpx.AsyncClient, cid: str, model: str,
 
 # ── app ────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Hoplite OpenAI Gateway", version="3.0.0")
+app = FastAPI(title="Hoplite OpenAI Gateway", version="3.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/v1/models")
@@ -726,6 +765,158 @@ async function send(){
 }
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
+
+# ── MCP server (streamable HTTP JSON-RPC at /mcp) ──────────────────────────
+# Lets any MCP client (OMP, Claude Desktop, Cursor) use the cloud agent as a TOOL
+# instead of a model: hoplite_ask blocks until the agent answers.
+
+MCP_TOOLS = [
+    {
+        "name": "hoplite_ask",
+        "description": ("Ask the Hoplite cloud coding agent (Claude Opus 5.5, GPT-5.5, Sonnet 5 — see "
+                        "hoplite_models) and WAIT for the answer. Blocking: 30s–15min per call "
+                        "(real cloud sandbox run). Use for big autonomous tasks: implement a feature, "
+                        "fix a bug in the repo, deep analysis. Pass the same `conversation` id to "
+                        "continue a dialogue (agent keeps context)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "the task/question for the agent"},
+                "conversation": {"type": "string", "description": "conversation id for continuity (default: 'mcp-default')"},
+                "model": {"type": "string", "description": "gateway model id (default hoplite-opus-5)"},
+                "reasoning_effort": {"type": "string", "enum": sorted(REASONING_MODES)},
+                "wait_s": {"type": "number", "description": "max seconds to block (default 120, max = DEADLINE); on expiry returns thread_id to poll"},
+            },
+            "required": ["prompt"],
+        },
+    },
+    {
+        "name": "hoplite_task",
+        "description": ("Fire-and-forget: start a cloud agent task and return thread_id IMMEDIATELY "
+                        "(non-blocking). Poll with hoplite_task_status. Best for MCP clients with "
+                        "short tool timeouts."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "conversation": {"type": "string"},
+                "model": {"type": "string"},
+                "reasoning_effort": {"type": "string", "enum": sorted(REASONING_MODES)},
+            },
+            "required": ["prompt"],
+        },
+    },
+    {
+        "name": "hoplite_task_status",
+        "description": "Check a running/finished Hoplite thread: status + latest messages. Non-blocking.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"thread_id": {"type": "string"},
+                           "conversation": {"type": "string", "description": "or look up by conversation id"}},
+        },
+    },
+    {
+        "name": "hoplite_models",
+        "description": "List gateway model ids and their Hoplite backends. Non-blocking.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "hoplite_conversations",
+        "description": "List known conversations → thread ids (memory map). Non-blocking.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+async def _mcp_dispatch(name: str, args: dict) -> str:
+    if name == "hoplite_ask":
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            raise HopliteError("prompt is required", 400)
+        conv = f"mcp:{args.get('conversation') or 'default'}"
+        model = args.get("model") or "hoplite-opus-5"
+        wait_s = min(max(float(args.get("wait_s", MCP_ASK_DEFAULT_WAIT)), 10.0), float(DEADLINE))
+        tid, answer = await _ask_agent(prompt, conv, model,
+                                       reasoning=args.get("reasoning_effort"), wait_s=wait_s)
+        if answer is not None:
+            return answer
+        return (f"[still running after {int(wait_s)}s] thread_id={tid} conversation="
+                f"{args.get('conversation') or 'default'} — poll hoplite_task_status, "
+                f"or see https://app.hoplite.sh")
+    if name == "hoplite_task":
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            raise HopliteError("prompt is required", 400)
+        conv = f"mcp:{args.get('conversation') or 'default'}"
+        model = args.get("model") or "hoplite-opus-5"
+        tid, _ = await _ask_agent(prompt, conv, model,
+                                  reasoning=args.get("reasoning_effort"), wait_s=0.0001)
+        return json.dumps({"thread_id": tid, "conversation": args.get("conversation") or "default",
+                           "note": "agent started; poll hoplite_task_status with thread_id or conversation"},
+                          ensure_ascii=False)
+    if name == "hoplite_task_status":
+        tid = args.get("thread_id")
+        if not tid and args.get("conversation"):
+            tid = _conv_threads.get(f"mcp:{args['conversation']}") or _conv_threads.get(args["conversation"])
+        if not tid:
+            raise HopliteError("thread_id or known conversation required", 400)
+        async with _client() as c:
+            status = await _thread_status(c, tid)
+            msgs = await _msg_list(c, tid)
+            tail = [f"[{m.get('role')}] {str(m.get('content',''))[:400]}"
+                    for m in msgs[-4:] if m.get("role") in ("user", "assistant")]
+            return json.dumps({"thread_id": tid, "status": status, "messages": tail},
+                              ensure_ascii=False, indent=1)
+    if name == "hoplite_models":
+        rows = [f"{m} -> {MODEL_ID_MAP.get(m) or 'project default'}" for m in MODELS]
+        rows.append("suffix -fast -> speed:fast | suffix -local -> runs on YOUR PC (needs Desktop binding)")
+        return "\n".join(rows)
+    if name == "hoplite_conversations":
+        return json.dumps(_conv_threads, indent=1) or "{}"
+    raise HopliteError(f"unknown tool: {name}", 400)
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    denied = _check_auth(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32700, "message": "parse error"}}, status_code=400)
+    mid, method, params = body.get("id"), body.get("method", ""), body.get("params") or {}
+
+    if method == "initialize":
+        return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": params.get("protocolVersion", "2025-03-26"),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "hoplite-gateway", "version": "3.6.0"},
+            "instructions": ("Tools to run tasks on Hoplite cloud coding agents (Opus 5.5 etc). "
+                             "hoplite_ask blocks 30s-15min — use for big autonomous tasks, not chat.")}})
+    if method.startswith("notifications/"):
+        return Response(status_code=202)
+    if method == "ping":
+        return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": {}})
+    if method == "tools/list":
+        return JSONResponse({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
+    if method == "tools/call":
+        name, args = params.get("name", ""), params.get("arguments") or {}
+        try:
+            text = await _mcp_dispatch(name, args)
+            return JSONResponse({"jsonrpc": "2.0", "id": mid,
+                                 "result": {"content": [{"type": "text", "text": text}], "isError": False}})
+        except HopliteError as e:
+            return JSONResponse({"jsonrpc": "2.0", "id": mid,
+                                 "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}})
+        except Exception as e:
+            return JSONResponse({"jsonrpc": "2.0", "id": mid,
+                                 "result": {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}],
+                                            "isError": True}})
+    return JSONResponse({"jsonrpc": "2.0", "id": mid,
+                         "error": {"code": -32601, "message": f"method not found: {method}"}})
+
 
 # ── main ───────────────────────────────────────────────────────────────────
 

@@ -137,6 +137,28 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 `reasoning_effort` (`off…xhigh|max`) maps to Hoplite `reasoning.mode`.
 Full walkthrough (Russian): **[GUIDE.md](GUIDE.md)**
 
+## MCP server (built-in, at `/mcp`)
+
+The gateway is ALSO an MCP server — use the cloud agent as a **tool** instead of
+a model (no per-message latency for everything, only when you call it):
+
+| Tool | What |
+|------|------|
+| `hoplite_ask` | blocking: give a task → wait → get the agent's answer (conversation continuity via `conversation` id) |
+| `hoplite_task_status` | non-blocking: check a running thread |
+| `hoplite_models` | list models/backends |
+| `hoplite_conversations` | conversation → thread map |
+
+OMP client config (`~/.omp/agent/mcp.json`):
+```json
+"hoplite-gw": {
+  "type": "http",
+  "url": "http://127.0.0.1:8787/mcp",
+  "headers": {"Authorization": "Bearer sk-local",
+              "Accept": "application/json, text/event-stream"}
+}
+```
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -148,6 +170,7 @@ Full walkthrough (Russian): **[GUIDE.md](GUIDE.md)**
 | POST | `/v1/chat/completions` | OpenAI chat (stream + tools) |
 | POST | `/admin/config` | hot-update api_key / project_id |
 | POST | `/admin/ngrok` | start/stop/status tunnel |
+| POST | `/mcp` | MCP server (streamable HTTP JSON-RPC) |
 
 ## Files
 
