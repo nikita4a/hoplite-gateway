@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -80,7 +81,14 @@ def _load_config() -> dict:
     return {}
 
 def _save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        cur = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+        if not isinstance(cur, dict):
+            cur = {}
+    except Exception:
+        cur = {}
+    cur.update(cfg)
+    CONFIG_FILE.write_text(json.dumps(cur, indent=2), encoding="utf-8")
 
 CONFIG = _load_config()
 API_KEY: str = CONFIG.get("api_key", "")
@@ -517,7 +525,7 @@ async def _complete(body: dict) -> Any:
     if not API_KEY:
         msg = ("No API key. Open http://127.0.0.1:8787/ (dashboard) or put "
                '{"api_key": "hop_..."} into config.json next to server.py, then restart.')
-        return _stream_or_static(stream, cid, model, msg, None, _err(msg, "auth_error", 401))
+        return _err(msg, "auth_error", 401)
 
     user_text = _last_user_text(messages)
     tool_results = _tool_results_text(messages)
@@ -573,7 +581,7 @@ async def _complete(body: dict) -> Any:
 
                 if stream:
                     return StreamingResponse(
-                        _stream_run(c, cid, model, tid, tools),
+                        _stream_owned(cid, model, tid, tools),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -589,20 +597,32 @@ async def _complete(body: dict) -> Any:
         except Exception as e:
             return _err(f"gateway bug: {type(e).__name__}: {e}", "gateway_error", 500)
 
+async def _stream_owned(cid: str, model: str, tid: str, tools) -> AsyncGenerator[str, None]:
+    """Own the httpx client and the concurrency slot for the WHOLE stream.
+
+    FastAPI consumes a StreamingResponse generator only after the handler has returned,
+    so a client opened by the handler's `async with _client()` is already closed by then:
+    every poll inside _run_agent raised, `except Exception: pass` swallowed it, and the
+    request spun to DEADLINE even though the agent had answered. Opening both here keeps
+    them alive exactly as long as chunks are produced.
+    """
+    async with _sem, _client() as c:
+        async for chunk in _stream_run(c, cid, model, tid, tools):
+            yield chunk
+
 async def _stream_run(c: httpx.AsyncClient, cid: str, model: str,
                       tid: str, tools) -> AsyncGenerator[str, None]:
     """Real streaming: deltas as the agent writes; tool_calls emitted at end."""
     yield _sse(cid, model, {"role": "assistant"})
     buffer = ""
     try:
-        async def on_delta(piece: str):
-            nonlocal buffer
-            buffer += piece
-        # NOTE: _run_agent awaits on_delta; we collect then flush per poll tick.
-        # To stream incrementally we wrap: emit inside on_delta via queue.
+        # Deltas are queued for streaming; the same callback also accumulates
+        # buffer so the final flush emits only the not-yet-streamed remainder.
         q: asyncio.Queue[str | None] = asyncio.Queue()
 
         async def on_delta_q(piece: str):
+            nonlocal buffer
+            buffer += piece
             await q.put(piece)
 
         task = asyncio.create_task(_run_agent(c, tid, on_delta_q))
@@ -723,7 +743,8 @@ async def admin_ngrok(request: Request):
     # start
     if _ngrok_proc and _ngrok_proc.poll() is None:
         return {"ok": True, "running": True, "url": _ngrok_url}
-    token = (body.get("token") or CONFIG.get("ngrok_token") or "").strip()
+    token = (body.get("token") or CONFIG.get("ngrok_token")
+             or os.environ.get("NGROK_AUTHTOKEN") or "").strip()
     try:
         args = ["ngrok", "http", str(PORT), "--log", "stdout"]
         if token:

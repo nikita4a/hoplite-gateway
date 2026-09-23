@@ -1,9 +1,13 @@
 """Offline unit tests for the gateway (no network, no Hoplite calls).
 Run: python tests_gateway.py
 """
+import asyncio
 import importlib.util
 import json
+import os
 import sys
+import tempfile
+from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("srv", "server.py")
 srv = importlib.util.module_from_spec(spec)
@@ -119,6 +123,188 @@ def test_slim_schema_and_wrap_cap():
         assert f"tool_{i}" in wrapped
     slim = srv._slim_schema({"description": "y" * 500, "type": "object"})
     assert len(slim["description"]) <= 120
+
+
+def _sse_contents(agen):
+    """Collect all delta.content strings from _stream_run SSE chunks."""
+    out = []
+
+    async def go():
+        async for chunk in agen:
+            for line in chunk.splitlines():
+                if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+                    continue
+                payload = json.loads(line[6:])
+                for ch in payload["choices"]:
+                    d = ch.get("delta", {})
+                    if isinstance(d.get("content"), str):
+                        out.append(d["content"])
+
+    asyncio.run(go())
+    return out
+
+
+def test_stream_deltas_not_duplicated():
+    """Every delta streamed once; the final flush must not re-emit the whole text."""
+    async def fake_run(client, tid, on_delta=None):
+        await on_delta("Hello ")
+        await on_delta("world")
+        return "Hello world"
+
+    orig = srv._run_agent
+    srv._run_agent = fake_run
+    try:
+        content = "".join(_sse_contents(srv._stream_run(None, "cid", "m", "tid", None)))
+    finally:
+        srv._run_agent = orig
+    assert content == "Hello world", f"expected 'Hello world' exactly once, got {content!r}"
+
+
+def test_stream_flush_when_no_deltas():
+    """Agent output with zero deltas must still be emitted exactly once."""
+    async def fake_run(client, tid, on_delta=None):
+        return "Final only"
+
+    orig = srv._run_agent
+    srv._run_agent = fake_run
+    try:
+        content = "".join(_sse_contents(srv._stream_run(None, "cid", "m", "tid", None)))
+    finally:
+        srv._run_agent = orig
+    assert content == "Final only", f"expected 'Final only' exactly once, got {content!r}"
+
+
+def test_save_config_preserves_unknown_keys():
+    """Saving one key must not delete the other eight pre-existing keys."""
+    nine = {
+        "api_key": "hop_old",
+        "api_base": "https://api.hoplite.sh",
+        "project_id": "proj_x",
+        "ngrok_token": "",
+        "cookies": {"hop_session": "abc123", "nested": {"k": "v"}},
+        "gateway_key": "gk_1",
+        "deadline_s": 540,
+        "queue_limit": 4,
+        "mcp_ask_wait_s": 120,
+    }
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "config.json"
+        tmp.write_text(json.dumps(nine), encoding="utf-8")
+        orig = srv.CONFIG_FILE
+        srv.CONFIG_FILE = tmp
+        try:
+            srv._save_config({"api_key": "hop_test1234abcd"})
+            got = srv._load_config()
+        finally:
+            srv.CONFIG_FILE = orig
+        for k, v in nine.items():
+            if k == "api_key":
+                assert got[k] == "hop_test1234abcd", f"api_key not updated: {got.get(k)!r}"
+            else:
+                assert k in got, f"key {k} deleted by save"
+                assert got[k] == v, f"{k} changed: {v!r} -> {got[k]!r}"
+
+
+def test_missing_api_key_returns_401():
+    """No API key → 401 auth_error envelope, not a 500 NameError."""
+    orig = srv.API_KEY
+    srv.API_KEY = ""
+    try:
+        resp = asyncio.run(srv._complete(
+            {"model": "hoplite-opus-5",
+             "messages": [{"role": "user", "content": "hi"}]}))
+    finally:
+        srv.API_KEY = orig
+    assert resp.status_code == 401, f"expected 401, got {resp.status_code}"
+    body = json.loads(resp.body)
+    assert body["error"]["type"] == "auth_error", body
+    assert "No API key" in body["error"]["message"]
+
+
+def test_ngrok_uses_env_authtoken():
+    """NGROK_AUTHTOKEN is the last fallback after body.token and CONFIG."""
+    captured = {}
+
+    def fake_popen(args, **kw):
+        captured["args"] = list(args)
+        raise FileNotFoundError("ngrok not installed")   # abort before the 15s poll loop
+
+    class Req:
+        async def json(self):
+            return {"action": "start", "token": ""}
+
+    orig_popen = srv.subprocess.Popen
+    orig_token = srv.CONFIG.get("ngrok_token")
+    orig_env = os.environ.get("NGROK_AUTHTOKEN")
+    srv.subprocess.Popen = fake_popen
+    srv.CONFIG["ngrok_token"] = ""
+    os.environ["NGROK_AUTHTOKEN"] = "tok-env-123"
+    srv._ngrok_proc = None
+    srv._ngrok_url = ""
+    try:
+        asyncio.run(srv.admin_ngrok(Req()))
+    finally:
+        srv.subprocess.Popen = orig_popen
+        srv.CONFIG["ngrok_token"] = orig_token
+        if orig_env is None:
+            os.environ.pop("NGROK_AUTHTOKEN", None)
+        else:
+            os.environ["NGROK_AUTHTOKEN"] = orig_env
+    assert captured.get("args"), "Popen was never called"
+    i = captured["args"].index("--authtoken")
+    assert captured["args"][i + 1] == "tok-env-123", captured["args"]
+
+
+def test_stream_response_owns_its_client():
+    """FastAPI consumes a StreamingResponse generator AFTER the handler returns, so the
+    httpx client must be opened INSIDE the generator.
+
+    Regression: _complete returned StreamingResponse(_stream_run(c, ...)) from inside
+    `async with _client() as c`. The client was closed on return, every poll inside
+    _run_agent raised, `except Exception: pass` swallowed it, and the gateway spun to
+    DEADLINE (540 s) although the agent had answered in ~50 s. Non-streaming worked;
+    streaming never did — and streaming is what opencode/OMP always send.
+    """
+    import inspect
+    assert inspect.isasyncgenfunction(srv._stream_owned), "_stream_owned must be an async generator"
+    src = inspect.getsource(srv._complete)
+    assert "_stream_owned(" in src, "the stream branch must hand off to _stream_owned"
+    assert "_stream_run(c," not in src, "the stream branch must not leak the handler-scoped client"
+
+    events = []
+    observed = {}
+    sem_before = srv._sem._value      # Semaphore.locked() is False while any slot is free
+
+    class FakeClient:
+        async def __aenter__(self):
+            events.append("open")
+            return self
+
+        async def __aexit__(self, *exc):
+            events.append("close")
+            return False
+
+    async def fake_stream_run(c, cid, model, tid, tools):
+        events.append("streaming")
+        observed["sem_value"] = srv._sem._value
+        yield "data: one\n\n"
+        yield "data: two\n\n"
+
+    orig_client, orig_run = srv._client, srv._stream_run
+    srv._client = lambda: FakeClient()
+    srv._stream_run = fake_stream_run
+    try:
+        async def go():
+            return [chunk async for chunk in srv._stream_owned("cid", "hoplite-opus-5", "thr_x", None)]
+        chunks = asyncio.run(go())
+    finally:
+        srv._client, srv._stream_run = orig_client, orig_run
+
+    assert chunks == ["data: one\n\n", "data: two\n\n"], chunks
+    # client open BEFORE the first chunk, closed only AFTER the last one
+    assert events == ["open", "streaming", "close"], events
+    assert observed["sem_value"] == sem_before - 1, \
+        "the concurrency guard must be held for the whole stream"
 
 
 if __name__ == "__main__":
