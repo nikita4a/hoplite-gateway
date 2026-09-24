@@ -402,6 +402,28 @@ def test_stream_with_tools_prose_delivered_once():
     assert any(c.get("finish_reason") == "stop" for c in chunks)
 
 
+def test_mcp_notifications_return_202():
+    """POST /mcp with a notifications/* method must answer 202, not 500.
+
+    Regression, observed live before the fix (3x HTTP 500 in gateway_stderr.log):
+    the handler returned Response(status_code=202) but `Response` was never imported
+    from fastapi.responses, so every MCP client's `notifications/initialized` — which
+    is sent right after initialize, i.e. on every single connection — blew up with a
+    NameError.
+    """
+    class Req:
+        async def json(self):
+            return {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+    orig = srv._check_auth
+    srv._check_auth = lambda request: None
+    try:
+        resp = asyncio.run(srv.mcp_endpoint(Req()))
+    finally:
+        srv._check_auth = orig
+    assert resp.status_code == 202, f"expected 202, got {resp.status_code}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
