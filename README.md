@@ -137,6 +137,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 `reasoning_effort` (`off…xhigh|max`) maps to Hoplite `reasoning.mode`.
 Full walkthrough (Russian): **[GUIDE.md](GUIDE.md)**
 
+**Обратное направление** — дать облачному агенту Hoplite shell и файлы на твоём ПК
+(настоящие MCP-инструменты через ngrok-туннель): [`nikita4a/hoplite-pc-bridge`](https://github.com/nikita4a/hoplite-pc-bridge).
+
 ## PC Agent — cloud Opus 5.5 with hands on YOUR machine
 
 `pc_agent.py` gives the cloud agent **local tools** (read_file, write_file,
